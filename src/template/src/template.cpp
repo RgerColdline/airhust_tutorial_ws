@@ -172,12 +172,15 @@ int main(int argc, char **argv)
 
       // mission2: 世界系前进（示例路径点）
       case 2:
-        if (mission_pos_cruise(1.0, 0.0, ALTITUDE, 0.0 , err_max))
+        if(!isReached(13.0,2.5,1.5,err_max))
+        {
+          avoid_to_point(13.0,2.5,1.5,0,err_max);
+        }
+        else
         {
           mission_num = 3;
           last_request = ros::Time::now();
         }
-        break;
 
       // mission3: 识别任务区域巡航
       case 3:

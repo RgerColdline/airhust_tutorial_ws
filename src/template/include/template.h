@@ -297,3 +297,32 @@ bool precision_land()
     }
     return false;
 }
+
+
+
+//************************************************************************
+//judge whether the drone reach the target point
+bool isReached(float target_x, float target_y, float target_z, float error_max)
+{
+	if (fabs(local_pos.pose.pose.position.x - target_x) < error_max && fabs(local_pos.pose.pose.position.y - target_y) < error_max && fabs(local_pos.pose.pose.position.z - target_z) < error_max)
+	{
+		return true;
+	}
+	else
+	{
+		return false;
+	}
+}
+
+//avoid and get to the target point
+void avoid_to_point(float target_x, float target_y, float target_z, float target_yaw, float error_max)
+{
+	setpoint_raw.type_mask = /*1 + 2 + 4 */ +8 + 16 + 32 + 64 + 128 + 256 + 512 /*+ 1024 */ + 2048;
+	setpoint_raw.coordinate_frame = 1;
+    //dai wan cheng
+	setpoint_raw.position.x = target_x;
+	setpoint_raw.position.y = target_y;
+	setpoint_raw.position.z = target_z;
+	setpoint_raw.yaw = target_yaw;
+	ROS_INFO("now (%.2f,%.2f,%.2f) to ( %.2f, %.2f, %.2f)", local_pos.pose.pose.position.x ,local_pos.pose.pose.position.y, local_pos.pose.pose.position.z, target_x, target_y, target_z);
+}
