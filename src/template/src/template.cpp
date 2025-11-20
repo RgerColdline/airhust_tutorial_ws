@@ -2,8 +2,13 @@
 
 // 全局变量定义
 int mission_num = 0;
-float if_debug = 0;
-float err_max = 0.2;
+
+
+
+// add target publisher
+ros::Publisher target_pub;
+
+
 void print_param()
 {
   std::cout << "=== 控制参数 ===" << std::endl;
@@ -28,8 +33,16 @@ int main(int argc, char **argv)
   ros::Subscriber state_sub = nh.subscribe<mavros_msgs::State>("mavros/state", 10, state_cb);
   ros::Subscriber local_pos_sub = nh.subscribe<nav_msgs::Odometry>("/mavros/local_position/odom", 10, local_pos_cb);
 
+  // 订阅下视摄像头图像话题
+  image_transport::ImageTransport it(nh);
+  image_transport::Subscriber down_camera_sub = it.subscribe("camera/image_raw", 1, downCameraCallback);
+
+
   // 发布无人机多维控制话题
   ros::Publisher mavros_setpoint_pos_pub = nh.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 100);
+
+  // create target publisher
+  target_pub = nh.advertise<std_msgs::String>("/target", 10);
 
   // 创建服务客户端
   ros::ServiceClient arming_client = nh.serviceClient<mavros_msgs::CommandBool>("mavros/cmd/arming");
@@ -140,12 +153,15 @@ int main(int argc, char **argv)
     
     switch (mission_num)
     {
-      // mission1: 起飞
+      // mission1: 起飞并悬停10秒（满足任务要求）
       case 1:
         if (mission_pos_cruise(0, 0, ALTITUDE, 0, err_max))
         {
-          mission_num = 2;
-          last_request = ros::Time::now();
+          static ros::Time hover_start_time = ros::Time::now();
+          if (ros::Time::now() - hover_start_time > ros::Duration(10.0)) {
+            mission_num = 2;
+            last_request = ros::Time::now();
+          }
         }
 	    else if(ros::Time::now() - last_request >= ros::Duration(3.0))
         {
@@ -154,7 +170,7 @@ int main(int argc, char **argv)
         }
         break;
 
-      //世界系前进
+      // mission2: 世界系前进（示例路径点）
       case 2:
         if (mission_pos_cruise(1.0, 0.0, ALTITUDE, 0.0 , err_max))
         {
@@ -163,9 +179,48 @@ int main(int argc, char **argv)
         }
         break;
 
-      //降落
+      // mission3: 识别任务区域巡航
       case 3:
-        if(precision_land())
+        {
+          static bool targets_recognized = false;
+          static ros::Time search_start_time = ros::Time::now();
+          
+          // 在识别区域巡航搜索
+          if (mission_pos_cruise(2.0, 0.0, ALTITUDE, 0.0, err_max) || 
+              mission_pos_cruise(2.0, 1.0, ALTITUDE, 0.0, err_max) ||
+              mission_pos_cruise(1.0, 1.0, ALTITUDE, 0.0, err_max))
+          {
+            // 尝试识别目标
+            if (down_camera_updated) {
+              std::vector<std::string> contents;
+              std::vector<geometry_msgs::Point> positions;
+              
+              if (recognizeTargets(contents, positions)) {
+                // 发布识别结果
+                for (size_t i = 0; i < contents.size(); i++) {
+                  std_msgs::String target_msg;
+                  target_msg.data = contents[i] + " at (" + 
+                                   std::to_string(positions[i].x) + ", " +
+                                   std::to_string(positions[i].y) + ", " +
+                                   std::to_string(positions[i].z) + ")";
+                  target_pub.publish(target_msg);
+                  ROS_INFO("识别到目标: %s", target_msg.data.c_str());
+                }
+                targets_recognized = true;
+              }
+            }
+            
+            if (targets_recognized || ros::Time::now() - search_start_time > ros::Duration(30.0)) {
+              mission_num = 4;
+              last_request = ros::Time::now();
+            }
+          }
+        }
+        break;
+
+      // mission4: 基于颜色识别的精准降落
+      case 4:
+        if (precision_land_with_color_detection())
         {
           mission_num = -1; // 任务结束
           last_request = ros::Time::now();
@@ -178,10 +233,9 @@ int main(int argc, char **argv)
     
     if(mission_num == -1) 
     {
+      ROS_INFO("所有任务完成！");
       exit(0);
     }
   }
   return 0;
 }
-
-

@@ -19,7 +19,12 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   geometry_msgs
   message_generation
+  cv_bridge
+  image_transport
 )
+
+find_package(OpenCV REQUIRED)
+
 catkin_package(
   INCLUDE_DIRS include
 )
@@ -29,6 +34,7 @@ include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
 )
 
 
