@@ -133,6 +133,10 @@ int main(int argc, char **argv)
         last_request = ros::Time::now();
       }
     }
+
+    // 持续发布设置点，确保无人机起飞
+    mavros_setpoint_pos_pub.publish(setpoint_raw);
+
     // 当无人机到达起飞点高度后，悬停3秒后进入任务模式，提高视觉效果
     if (fabs(local_pos.pose.pose.position.z - ALTITUDE) < 0.2)
     {
@@ -184,10 +188,12 @@ int main(int argc, char **argv)
       }
       break;
 
-    // mission2: 避障巡航到目标点(13.0, 2.5)
+    // mission2: 避障巡航到目标点(17.0, 2.5)
     case 2:
-      {float target_x = 13.0 + init_position_x_take_off;
-      float target_y = 2.5 + init_position_y_take_off;
+      {
+      // 目标以相对坐标表示（相对于起飞点）
+      float target_x = 17.0f; // 相对坐标，已更新为 15.0
+      float target_y = 2.5f;  // 相对坐标
       if (!isReached(target_x, target_y, ALTITUDE, err_max))
       {
         avoid_to_point(target_x, target_y, ALTITUDE, 0, err_max);
@@ -196,9 +202,11 @@ int main(int argc, char **argv)
       {
         mission_num = 3;
         last_request = ros::Time::now();
-      }}
+      }
+      break;
+    }
 
-      // mission3: 识别任务区域巡航
+    // mission3: 识别任务区域巡航
     case 3:
     {
       static bool targets_recognized = false;
@@ -214,8 +222,9 @@ int main(int argc, char **argv)
 
       if (search_point < 4)
       {
-        float x = search_points[search_point][0] + init_position_x_take_off;
-        float y = search_points[search_point][1] + init_position_y_take_off;
+        // 传递相对坐标给避障/巡航函数
+        float x = search_points[search_point][0];
+        float y = search_points[search_point][1];
 
         if (avoid_to_point(x, y, ALTITUDE, 0, err_max))
         {
