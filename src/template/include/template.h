@@ -25,10 +25,17 @@
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
 
+// 雷达相关头文件
+#include <sensor_msgs/LaserScan.h>
+#include <sensor_msgs/PointCloud.h>
+#include <laser_geometry/laser_geometry.h>
+
 
 using namespace std;
 
 #define ALTITUDE 1.5f
+#define SAFE_DISTANCE 1.0f
+#define OBSTACLE_AVOID_DISTANCE 3.0f
 
 float err_max = 0.2;
 float if_debug = 0;
@@ -98,6 +105,118 @@ void downCameraCallback(const sensor_msgs::ImageConstPtr& msg)
         ROS_ERROR("cv_bridge exception: %s", e.what());
     }
 }
+
+/************************************************************************
+函数 3.4：雷达数据回调函数和处理
+*************************************************************************/
+sensor_msgs::LaserScan laser_scan;
+bool laser_updated = false;
+vector<float> obstacle_distances; // 存储各个方向的障碍物距离
+bool obstacle_detected = false;
+float obstacle_direction = 0.0; // 障碍物相对于无人机前进方向的角度
+
+void laserCallback(const sensor_msgs::LaserScan::ConstPtr& msg)
+{
+    laser_scan = *msg;
+    laser_updated = true;
+    
+    // 处理雷达数据，检测障碍物
+    obstacle_detected = false;
+    float min_distance = 100.0; // 初始化一个较大的值
+    int min_index = -1;
+    
+    // 分析雷达数据，检测前方障碍物
+    int num_readings = laser_scan.ranges.size();
+    obstacle_distances.clear();
+    obstacle_distances.resize(num_readings);
+    
+    for(int i = 0; i < num_readings; ++i) {
+        float distance = laser_scan.ranges[i];
+        obstacle_distances[i] = distance;
+        
+        // 检查是否在有效范围内且小于安全距离
+        if(!std::isinf(distance) && !std::isnan(distance) && 
+           distance > laser_scan.range_min && distance < laser_scan.range_max) {
+            
+            if(distance < OBSTACLE_AVOID_DISTANCE && distance < min_distance) {
+                min_distance = distance;
+                min_index = i;
+                obstacle_detected = true;
+            }
+        }
+    }
+    
+    if(obstacle_detected && min_index != -1) {
+        // 计算障碍物相对于无人机前进方向的角度
+        float angle = laser_scan.angle_min + min_index * laser_scan.angle_increment;
+        obstacle_direction = angle;
+        
+        if(if_debug == 1) {
+            ROS_INFO("检测到障碍物! 距离: %.2f米, 方向: %.2f弧度", min_distance, angle);
+        }
+    }
+}
+
+/************************************************************************
+函数 3.5：避障决策函数
+根据雷达数据决定避障方向
+*************************************************************************/
+geometry_msgs::Point calculateAvoidancePoint(float target_x, float target_y, float target_z)
+{
+    geometry_msgs::Point avoid_point;
+    avoid_point.x = local_pos.pose.pose.position.x;
+    avoid_point.y = local_pos.pose.pose.position.y;
+    avoid_point.z = target_z; // 保持当前高度
+    
+    if(!obstacle_detected) {
+        // 没有障碍物，直接返回目标点
+        avoid_point.x = target_x;
+        avoid_point.y = target_y;
+        return avoid_point;
+    }
+    
+    // 计算到目标点的方向
+    float dx = target_x - local_pos.pose.pose.position.x;
+    float dy = target_y - local_pos.pose.pose.position.y;
+    float target_direction = atan2(dy, dx);
+    
+    // 计算避障方向（向右避让）
+    float avoid_direction = target_direction + M_PI/2; // 向右转90度
+    
+    // 计算避障点（向右移动2米）
+    float avoid_distance = 2.0;
+    avoid_point.x = local_pos.pose.pose.position.x + avoid_distance * cos(avoid_direction);
+    avoid_point.y = local_pos.pose.pose.position.y + avoid_distance * sin(avoid_direction);
+    
+    // 检查避障方向是否安全
+    bool safe_direction = true;
+    for(int i = 0; i < obstacle_distances.size(); ++i) {
+        if(!std::isinf(obstacle_distances[i]) && !std::isnan(obstacle_distances[i])) {
+            float check_angle = laser_scan.angle_min + i * laser_scan.angle_increment;
+            float angle_diff = fabs(check_angle - avoid_direction);
+            if(angle_diff < M_PI/4 && obstacle_distances[i] < SAFE_DISTANCE) {
+                safe_direction = false;
+                break;
+            }
+        }
+    }
+    
+    if(!safe_direction) {
+        // 如果右侧不安全，尝试左侧
+        avoid_direction = target_direction - M_PI/2;
+        avoid_point.x = local_pos.pose.pose.position.x + avoid_distance * cos(avoid_direction);
+        avoid_point.y = local_pos.pose.pose.position.y + avoid_distance * sin(avoid_direction);
+        
+        if(if_debug == 1) {
+            ROS_INFO("向右避障不安全，尝试向左避障");
+        }
+    }
+    
+    return avoid_point;
+}
+
+
+
 
 /************************************************************************
 函数 4: 颜色识别函数 - 用于降落任务
@@ -314,15 +433,61 @@ bool isReached(float target_x, float target_y, float target_z, float error_max)
 	}
 }
 
-//avoid and get to the target point
-void avoid_to_point(float target_x, float target_y, float target_z, float target_yaw, float error_max)
+/************************************************************************
+函数 9: 避障飞行函数
+结合雷达数据的完整避障飞行
+*************************************************************************/
+bool avoid_to_point(float target_x, float target_y, float target_z, float target_yaw, float error_max)
 {
-	setpoint_raw.type_mask = /*1 + 2 + 4 */ +8 + 16 + 32 + 64 + 128 + 256 + 512 /*+ 1024 */ + 2048;
-	setpoint_raw.coordinate_frame = 1;
-    //dai wan cheng
-	setpoint_raw.position.x = target_x;
-	setpoint_raw.position.y = target_y;
-	setpoint_raw.position.z = target_z;
-	setpoint_raw.yaw = target_yaw;
-	ROS_INFO("now (%.2f,%.2f,%.2f) to ( %.2f, %.2f, %.2f)", local_pos.pose.pose.position.x ,local_pos.pose.pose.position.y, local_pos.pose.pose.position.z, target_x, target_y, target_z);
+    static geometry_msgs::Point current_target;
+    static bool avoiding = false;
+    static ros::Time avoid_start_time;
+    
+    // 检查是否到达目标点
+    if (isReached(target_x, target_y, target_z, error_max)) {
+        avoiding = false;
+        return true;
+    }
+    
+    // 如果有障碍物且需要避障
+    if (obstacle_detected && !avoiding) {
+        avoiding = true;
+        avoid_start_time = ros::Time::now();
+        ROS_WARN("检测到障碍物，开始避障!");
+    }
+    
+    if (avoiding) {
+        // 计算避障点
+        current_target = calculateAvoidancePoint(target_x, target_y, target_z);
+        
+        // 设置避障目标点
+        setpoint_raw.type_mask = 0b0000111111000111;
+        setpoint_raw.coordinate_frame = 1;
+        setpoint_raw.position.x = current_target.x;
+        setpoint_raw.position.y = current_target.y;
+        setpoint_raw.position.z = target_z;
+        setpoint_raw.yaw = target_yaw;
+        
+        // 检查是否到达避障点或避障超时
+        if (isReached(current_target.x, current_target.y, target_z, error_max) || 
+            ros::Time::now() - avoid_start_time > ros::Duration(10.0)) {
+            avoiding = false;
+        }
+    } else {
+        // 正常飞行到目标点
+        setpoint_raw.type_mask = 0b0000111111000111;
+        setpoint_raw.coordinate_frame = 1;
+        setpoint_raw.position.x = target_x;
+        setpoint_raw.position.y = target_y;
+        setpoint_raw.position.z = target_z;
+        setpoint_raw.yaw = target_yaw;
+    }
+    
+    ROS_INFO("当前位置: (%.2f,%.2f,%.2f) 目标: (%.2f,%.2f,%.2f)%s", 
+             local_pos.pose.pose.position.x, local_pos.pose.pose.position.y, 
+             local_pos.pose.pose.position.z, setpoint_raw.position.x, 
+             setpoint_raw.position.y, setpoint_raw.position.z,
+             avoiding ? " [避障模式]" : "");
+    
+    return false;
 }
