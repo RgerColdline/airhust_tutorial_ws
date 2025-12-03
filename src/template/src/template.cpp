@@ -190,7 +190,7 @@ int main(int argc, char **argv)
 
     // mission2: 避障巡航到目标点(17.0, 2.5)
     case 2:
-      {
+    {
       // 目标以相对坐标表示（相对于起飞点）
       float target_x = 17.0f; // 相对坐标，已更新为 15.0
       float target_y = 2.5f;  // 相对坐标
@@ -200,81 +200,55 @@ int main(int argc, char **argv)
       }
       else
       {
-        mission_num = 3;
+        // 目标点到达后，直接切换到 case 4（跳过 case 3）
+        mission_num = 4;
         last_request = ros::Time::now();
       }
       break;
     }
 
-    // mission3: 识别任务区域巡航
-    case 3:
+    // mission4: chuan huan
+    case 4:
     {
-      static bool targets_recognized = false;
-      static ros::Time search_start_time = ros::Time::now();
+      static bool circle_done = false;
+      static bool square_done = false;
+      // 参考点：以 mission2 的目标为环中心（修改为你实际想要的中心）
 
-      // 定义搜索路径点
-      static int search_point = 0;
-      float search_points[][2] = {
-          {2.0, 0.0},
-          {2.0, 1.0},
-          {1.0, 1.0},
-          {1.0, 0.0}};
-
-      if (search_point < 4)
+      if (!circle_done)
       {
-        // 传递相对坐标给避障/巡航函数
-        float x = search_points[search_point][0];
-        float y = search_points[search_point][1];
-
-        if (avoid_to_point(x, y, ALTITUDE, 0, err_max))
+        float ring_center_x = 19.0f; // 如果你需要用 15.0 或其他，请修改为相应值
+        float ring_center_y = 2.4f;
+        float ring_alt = ALTITUDE;
+        // 圆环：半径 1.0m ，点数 12
+        if (fly_through_circle_ring(ring_center_x, ring_center_y, ring_alt, 1.0f, 12, err_max))
         {
-          search_point++;
+          circle_done = true;
           last_request = ros::Time::now();
+          ROS_INFO("圆环完成");
         }
-
-        // 在搜索点尝试识别目标
-        if (down_camera_updated)
+      }
+      else if (!square_done)
+      {
+        float ring_center_x = 19.0f; // 使用 mission2 目标 x 或你实际需要的中心
+        float ring_center_y = 2.4f;
+        float ring_center_z = ALTITUDE; // 垂直方环中心高度
+        float ring_alt = ALTITUDE;
+        // 垂直方环：center_x不变，在 y-z 平面穿越
+        if (fly_through_vertical_square_ring(ring_center_x, ring_center_y, ring_center_z, 2.2f, err_max))
         {
-          std::vector<std::string> contents;
-          std::vector<geometry_msgs::Point> positions;
-
-          if (recognizeTargets(contents, positions))
-          {
-            for (size_t i = 0; i < contents.size(); i++)
-            {
-              std_msgs::String target_msg;
-              target_msg.data = contents[i] + " at (" +
-                                std::to_string(positions[i].x) + ", " +
-                                std::to_string(positions[i].y) + ", " +
-                                std::to_string(positions[i].z) + ")";
-              target_pub.publish(target_msg);
-              ROS_INFO("识别到目标: %s", target_msg.data.c_str());
-            }
-            targets_recognized = true;
-          }
+          square_done = true;
+          last_request = ros::Time::now();
+          ROS_INFO("垂直方环完成");
         }
       }
       else
       {
-        // 搜索完成
-        if (targets_recognized || ros::Time::now() - search_start_time > ros::Duration(30.0))
-        {
-          mission_num = 4;
-          last_request = ros::Time::now();
-          ROS_INFO("识别任务完成，开始精准降落");
-        }
+        // 两个环都完成，结束任务或进入下一个流程
+        mission_num = -1;
+        last_request = ros::Time::now();
       }
     }
     break;
-
-    // mission4: 基于颜色识别的精准降落
-    case 4:
-      if (precision_land_with_color_detection())
-      {
-        mission_num = -1; // 任务结束
-        last_request = ros::Time::now();
-      }
-      break;
     }
     mavros_setpoint_pos_pub.publish(setpoint_raw);
     ros::spinOnce();

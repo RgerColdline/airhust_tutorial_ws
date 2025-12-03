@@ -30,20 +30,72 @@
 #include <sensor_msgs/LaserScan.h>
 #include <sensor_msgs/PointCloud.h>
 #include <laser_geometry/laser_geometry.h>
+#include <vector> // 新增: 使用std::vector
 
 using namespace std;
 
 #define ALTITUDE 1.5f
 #define SAFE_DISTANCE 1.0f
 #define OBSTACLE_AVOID_DISTANCE 1.5f  // 缩短避障触发距离，适应狭小场地
+#define TOO_CLOSE_LATERAL_THRESHOLD 0.6f // 小于该值则触发"横飞"(90度侧向)策略
+#define DOOR_FORWARD_MARGIN 0.8f // 前方需清空超过此距离则可尝试通过门/狭小路口
+#define DOOR_FORWARD_ANGLE (M_PI / 18.0) // 10度：前方向锥角一侧（半角）用来判定是否“前方清晰”
+
+// 新增：防抖/冷却阈值
+#define AVOID_MIN_LATERAL_THRESHOLD 0.15f   // 小于该横移直接向前，不触发侧移/横飞
+#define AVOID_SIDE_SWITCH_COOLDOWN 2.0      // 切换左右侧向的最小冷却时间（秒）
+#define AVOID_REUSE_RADIUS 0.20f            // 如果新避障点与上一次接近，则复用上一次的避障点
+#define AVOID_STUCK_CHECK_INTERVAL 3.0      // 秒：超时检测，发现卡住后尝试上升或后退
+
 // 最大单步移动距离（相对坐标，单位：米）
 #define MAX_STEP 0.3f     // 水平每次最多移动 0.3m，可根据场地再调小
 #define MAX_Z_STEP 0.2f   // 垂直每次最多移动 0.2m
 
+#define OBSTACLE_RECORD_DISTANCE 5.0f // 记录雷达点的最大距离，用于构成占据点云
+
+// 新增：请把基本工具函数实现上移，确保其他函数可以使用（避免未声明错误）
+static inline double normalizeAngle(double a)
+{
+    while (a > M_PI) a -= 2.0 * M_PI;
+    while (a < -M_PI) a += 2.0 * M_PI;
+    return a;
+}
+
+// 小工具：弧度转度
+static inline double radToDeg(double a)
+{
+    return a * 180.0 / M_PI;
+}
+
+// 小工具：角度左/右描述
+static inline std::string angleSide(double ang)
+{
+    if (fabs(ang) < 1e-6) return std::string("front");
+    if (ang > 0) return std::string("left");
+    return std::string("right");
+}
+
+static inline double pointDist2(double ax, double ay, double bx, double by)
+{
+    double dx = ax - bx;
+    double dy = ay - by;
+    return dx * dx + dy * dy;
+}
+
 float err_max = 0.2;
-float if_debug = 0;
+float if_debug = 1;
 
 mavros_msgs::PositionTarget setpoint_raw;
+
+// 保留：雷达相关的最小状态（不含避障逻辑）
+// laser_scan, laser_updated, obstacle_distances 用于上层处理或将来重写避障
+sensor_msgs::LaserScan laser_scan;
+bool laser_updated = false;
+std::vector<float> obstacle_distances; // 存储各个方向的障碍物距离
+bool obstacle_detected = false;
+
+// 新增：垂直方环函数声明（非避障相关，保留）
+bool fly_through_vertical_square_ring(float center_x, float center_y, float center_z, float side_length, float error_max);
 
 /************************************************************************
 函数 1：无人机状态回调函数
@@ -73,6 +125,12 @@ void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
     local_pos = *msg;
     tf::quaternionMsgToTF(local_pos.pose.pose.orientation, quat);
     tf::Matrix3x3(quat).getRPY(roll, pitch, yaw);
+    if (if_debug == 1) {
+        ROS_INFO("local_pos_cb: pos=(%.3f, %.3f, %.3f), rel=(%.3f, %.3f), yaw=%.1f deg", 
+                 local_pos.pose.pose.position.x, local_pos.pose.pose.position.y, local_pos.pose.pose.position.z,
+                 local_pos.pose.pose.position.x - init_position_x_take_off, local_pos.pose.pose.position.y - init_position_y_take_off,
+                 radToDeg(yaw));
+    }
     if (flag_init_position == false && (local_pos.pose.pose.position.z != 0))
     {
         init_position_x_take_off = local_pos.pose.pose.position.x;
@@ -81,6 +139,7 @@ void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
         init_yaw_take_off = yaw;
         flag_init_position = true;
     }
+    // NOTE: detailed laser debug logging moved to laserCallback to avoid using laser variables here
 }
 
 /************************************************************************
@@ -112,130 +171,44 @@ void downCameraCallback(const sensor_msgs::ImageConstPtr &msg)
 /************************************************************************
 函数 3.4：雷达数据回调函数和处理
 *************************************************************************/
-sensor_msgs::LaserScan laser_scan;
-bool laser_updated = false;
-vector<float> obstacle_distances; // 存储各个方向的障碍物距离
-bool obstacle_detected = false;
-float obstacle_direction = 0.0; // 障碍物相对于无人机前进方向的角度
-
 void laserCallback(const sensor_msgs::LaserScan::ConstPtr &msg)
 {
+    // 保持雷达订阅，但移除所有避障处理逻辑（仅保存原始 ranges 到 obstacle_distances）
     laser_scan = *msg;
     laser_updated = true;
-
-    // 处理雷达数据，检测障碍物
-    obstacle_detected = false;
-    float min_distance = 100.0; // 初始化一个较大的值
-    int min_index = -1;
-
-    // 分析雷达数据，检测前方障碍物
-    int num_readings = laser_scan.ranges.size();
     obstacle_distances.clear();
+    int num_readings = laser_scan.ranges.size();
     obstacle_distances.resize(num_readings);
-
-    for (int i = 0; i < num_readings; ++i)
-    {
-        float distance = laser_scan.ranges[i];
-        obstacle_distances[i] = distance;
-
-        // 检查是否在有效范围内且小于安全距离
-        if (!std::isinf(distance) && !std::isnan(distance) &&
-            distance > laser_scan.range_min && distance < laser_scan.range_max)
-        {
-
-            if (distance < OBSTACLE_AVOID_DISTANCE && distance < min_distance)
-            {
-                min_distance = distance;
-                min_index = i;
-                obstacle_detected = true;
-            }
-        }
+    for (int i = 0; i < num_readings; ++i) {
+        float d = laser_scan.ranges[i];
+        obstacle_distances[i] = d;
     }
-
-    if (obstacle_detected && min_index != -1)
-    {
-        // 计算障碍物相对于无人机前进方向的角度
-        float angle = laser_scan.angle_min + min_index * laser_scan.angle_increment;
-        obstacle_direction = angle;
-
-        if (if_debug == 1)
-        {
-            ROS_INFO("检测到障碍物! 距离: %.2f米, 方向: %.2f弧度", min_distance, angle);
-        }
-    }
+    // 不进行聚类/最小距离计算，避免与重写版本冲突
+    obstacle_detected = false;
+    if (if_debug == 1) ROS_INFO("laserCallback: received %d ranges", num_readings);
 }
+
+// 移除：中值窗函数（避障相关），如需重写请在新实现中添加
+
+// 新增：查找最大安全扇区（阈值表示判定为安全的最小距离）
+// 移除：查找最大安全扇区函数（避障相关）。如需重写，请在新文件中实现。
+
+// 新增实现：在安全扇区中选择角度最接近 target_direction 的扇区
+// 移除：findClosestSafeSector 实现（避障相关）。如需重写，请单独实现。
 
 /************************************************************************
 函数 3.5：避障决策函数
 根据雷达数据决定避障方向
 *************************************************************************/
+// 已移除复杂避障逻辑，提供一个最简单的占位实现：直接返回目标点（相对坐标）
 geometry_msgs::Point calculateAvoidancePoint(float target_x, float target_y, float target_z)
 {
-    // 说明：函数输入/输出均使用相对坐标（以起飞点为原点）
-    geometry_msgs::Point avoid_point;
-
-    // 当前相对位置（world -> relative）
-    double current_rel_x = local_pos.pose.pose.position.x - init_position_x_take_off;
-    double current_rel_y = local_pos.pose.pose.position.y - init_position_y_take_off;
-    avoid_point.z = target_z; // 高度保持为传入的相对高度
-
-    // 初始化为当前相对位置
-    avoid_point.x = current_rel_x;
-    avoid_point.y = current_rel_y;
-
-    if (!obstacle_detected)
-    {
-        // 没有障碍物，直接返回目标相对点
-        avoid_point.x = target_x;
-        avoid_point.y = target_y;
-        return avoid_point;
-    }
-
-    // 以相对坐标计算到目标点的方向
-    double dx = static_cast<double>(target_x) - current_rel_x;
-    double dy = static_cast<double>(target_y) - current_rel_y;
-    double target_direction = atan2(dy, dx);
-
-    // 计算避障方向：优先小幅侧移（45度）而非90度大转向
-    double side = (obstacle_direction >= 0.0f) ? 1.0 : -1.0; // 根据障碍相对角度选择侧向
-    double avoid_direction = target_direction + side * (M_PI / 4.0); // 45度侧移
-
-    // 计算较小的避障点（侧移距离减小）
-    double avoid_distance = 0.6; // 小幅侧移，适合狭小空间
-    avoid_point.x = current_rel_x + avoid_distance * cos(avoid_direction);
-    avoid_point.y = current_rel_y + avoid_distance * sin(avoid_direction);
-
-    // 检查避障方向是否安全（使用 laser_scan 中的角度）
-    bool safe_direction = true;
-    for (int i = 0; i < obstacle_distances.size(); ++i)
-    {
-        if (!std::isinf(obstacle_distances[i]) && !std::isnan(obstacle_distances[i]))
-        {
-            float check_angle = laser_scan.angle_min + i * laser_scan.angle_increment;
-            double angle_diff = fabs(check_angle - avoid_direction);
-            // 将角度阈值收紧为30度，避免因宽阈值误判触发大幅避让
-            if (angle_diff < M_PI / 6.0 && obstacle_distances[i] < SAFE_DISTANCE)
-            {
-                safe_direction = false;
-                break;
-            }
-        }
-    }
-
-    if (!safe_direction)
-    {
-        // 如果首选侧向不安全，尝试另一侧（同样小幅侧移）
-        avoid_direction = target_direction - side * (M_PI / 4.0);
-        avoid_point.x = current_rel_x + avoid_distance * cos(avoid_direction);
-        avoid_point.y = current_rel_y + avoid_distance * sin(avoid_direction);
-
-        if (if_debug == 1)
-        {
-            ROS_INFO("首选侧向不安全，尝试另一侧避障 (小幅 45°)");
-        }
-    }
-
-    return avoid_point;
+    geometry_msgs::Point p;
+    p.x = target_x;
+    p.y = target_y;
+    p.z = target_z;
+    if (if_debug == 1) ROS_INFO("calculateAvoidancePoint: stub returning target (%.3f, %.3f, %.3f)", p.x, p.y, p.z);
+    return p;
 }
 
 /************************************************************************
@@ -508,132 +481,205 @@ bool isReached(float target_x, float target_y, float target_z, float error_max)
 函数 9: 场地受限避障飞行函数
 针对小场地优化的避障策略 (修复类型不匹配问题)
 *************************************************************************/
+// 已移除复杂的避障流程：提供一个简单的包装器，直接调用 mission_pos_cruise
 bool avoid_to_point(float target_x, float target_y, float target_z, float target_yaw, float error_max)
 {
-    static bool avoiding = false;
-    static ros::Time avoid_start_time;
-    static geometry_msgs::Point avoid_target;
-    static int failed_avoidance_attempts = 0; // 失败尝试计数
-    static bool forced_navigation = false; // 强制导航模式
-    
-    // 场地边界限制 (根据您的实际场地修改这些值)
-    const float FIELD_MIN_X = 0.0;
-    const float FIELD_MAX_X = 15.0; // 假设场地X方向最大15米
-    const float FIELD_MIN_Y = 0.0;
-    const float FIELD_MAX_Y = 10.0; // 假设场地Y方向最大10米
-    
-    // 障碍物确认机制
-    static bool confirmed_obstacle = false;
-    static ros::Time last_obstacle_time;
-    
-    // 更新障碍物确认状态
-    if (obstacle_detected) {
-        if (!confirmed_obstacle) {
-            ROS_WARN("检测到障碍物，开始评估避障策略");
-        }
-        confirmed_obstacle = true;
-        last_obstacle_time = ros::Time::now();
-    } else if (confirmed_obstacle && (ros::Time::now() - last_obstacle_time > ros::Duration(1.0))) {
-        confirmed_obstacle = false;
-        forced_navigation = false;
-        failed_avoidance_attempts = 0;
-    }
-    
-    // 检查是否需要进入避障模式
-    if (confirmed_obstacle && !avoiding && !forced_navigation) {
-        avoiding = true;
-        avoid_start_time = ros::Time::now();
-        
-        // 计算避障点，但增加场地限制
-        avoid_target = calculateAvoidancePoint(target_x, target_y, target_z);
-        
-        // 检查避障点是否在场地范围内
-        if (avoid_target.x < FIELD_MIN_X || avoid_target.x > FIELD_MAX_X || 
-            avoid_target.y < FIELD_MIN_Y || avoid_target.y > FIELD_MAX_Y) {
-            ROS_WARN("计算的避障点(%.2f, %.2f)超出场地范围!", avoid_target.x, avoid_target.y);
-            
-            // 尝试替代避障策略 - 后退并上升
-            // 使用相对当前位置作为基准（world -> relative）
-            float current_rel_x = static_cast<float>(local_pos.pose.pose.position.x - init_position_x_take_off);
-            float current_rel_y = static_cast<float>(local_pos.pose.pose.position.y - init_position_y_take_off);
-            float current_z = static_cast<float>(local_pos.pose.pose.position.z);
-
-            // 选择一个在场地范围内的安全点（相对坐标）
-            avoid_target.x = current_rel_x - 1.0f; // 向后退1米（相对）
-            avoid_target.y = current_rel_y;
-            avoid_target.z = current_z + 0.5f; // 上升0.5米（高度仍使用world高度，mission_pos_cruise接受相对高度，后续调用使用target_z）
-
-            // 确保安全点在场地内
-            // 显式使用 double，避免 std::min/std::max 模板类型推导冲突
-            avoid_target.x = std::max(static_cast<double>(FIELD_MIN_X + 0.5f),
-                                      std::min<double>(avoid_target.x, static_cast<double>(FIELD_MAX_X - 0.5f)));
-            avoid_target.y = std::max(static_cast<double>(FIELD_MIN_Y + 0.5f),
-                                      std::min<double>(avoid_target.y, static_cast<double>(FIELD_MAX_Y - 0.5f)));
-            avoid_target.z = std::min<double>(avoid_target.z, static_cast<double>(3.0));
-             
-            ROS_INFO("使用替代避障点: (%.2f, %.2f, %.2f)", avoid_target.x, avoid_target.y, avoid_target.z);
-        }
-    }
-    
-    // 避障模式
-    if (avoiding && !forced_navigation) {
-        // 使用mission_pos_cruise飞向避障点
-        bool reached_avoid_point = mission_pos_cruise(
-            avoid_target.x, 
-            avoid_target.y, 
-            avoid_target.z > 0 ? avoid_target.z : target_z, 
-            target_yaw, 
-            error_max * 1.5f // 放宽避障点的到达精度
-        );
-        
-        // 检查是否到达避障点或超时
-        bool timeout = (ros::Time::now() - avoid_start_time > ros::Duration(8.0));
-        
-        if (reached_avoid_point || timeout) {
-            if (timeout) {
-                ROS_WARN("避障点到达超时，尝试直接前往目标");
-                failed_avoidance_attempts++;
-            }
-            
-            // 检查是否仍然检测到障碍物
-            if (obstacle_detected && failed_avoidance_attempts < 3) {
-                // 重新计算避障点
-                avoid_start_time = ros::Time::now();
-                avoid_target = calculateAvoidancePoint(target_x, target_y, target_z);
-                ROS_INFO("重新计算避障点: (%.2f, %.2f)", avoid_target.x, avoid_target.y);
-            } else if (failed_avoidance_attempts >= 3) {
-                // 多次失败后，尝试强制导航
-                ROS_WARN("多次避障失败，切换到强制导航模式");
-                forced_navigation = true;
-                avoiding = false;
-                failed_avoidance_attempts = 0;
-            } else {
-                // 成功绕过障碍物
-                avoiding = false;
-                ROS_INFO("成功绕过障碍物，继续前往目标点");
-            }
-        }
-        
-        // 打印状态
-        ROS_INFO("避障模式: 当前(%.2f,%.2f,%.2f) -> 避障点(%.2f,%.2f,%.2f) [%d次失败]",
-                 static_cast<float>(local_pos.pose.pose.position.x), 
-                 static_cast<float>(local_pos.pose.pose.position.y), 
-                 static_cast<float>(local_pos.pose.pose.position.z),
-                 avoid_target.x, avoid_target.y, avoid_target.z > 0 ? avoid_target.z : target_z,
-                 failed_avoidance_attempts);
-                 
-        return false;
-    }
-    
-    // 强制导航模式 - 当避障多次失败时
-    if (forced_navigation) {
-        ROS_WARN_THROTTLE(1.0, "强制导航模式: 忽略障碍物，直接前往目标点");
-        float current_z = static_cast<float>(local_pos.pose.pose.position.z);
-        float safe_z = std::max(target_z, current_z + 0.3f);
-        return mission_pos_cruise(target_x, target_y, safe_z, target_yaw, error_max * 2.0f);
-    }
-    
-    // 正常飞行模式
-    ROS_INFO("正常飞行模式: 前往目标点(%.2f, %.2f, %.2f)", target_x, target_y, target_z);
+    if (if_debug == 1) ROS_INFO("avoid_to_point: stub forwarding to mission_pos_cruise (%.3f, %.3f, %.3f)", target_x, target_y, target_z);
     return mission_pos_cruise(target_x, target_y, target_z, target_yaw, error_max);
 }
+
+/************************************************************************
+函数 10: 圆环飞行函数（直线穿环实现）
+从环的一侧直线通过中心到另一侧，适合“直着传过去”需求
+*************************************************************************/
+bool fly_through_circle_ring(float center_x, float center_y, float z, float radius, int points, float error_max);
+bool fly_through_circle_ring(float center_x, float center_y, float z, float radius, int points, float error_max)
+{
+    // 使用相对坐标（以起飞点为原点）
+    static bool initialized = false;
+    static std::vector<geometry_msgs::Point> waypoints;
+    static int idx = 0;
+
+    if (!initialized)
+    {
+        waypoints.clear();
+        idx = 0;
+        // 生成直线穿过圆心的路径点
+        int n = std::max(2, points); // 至少两个点：起点和终点
+        double approach = 1.0; // 在圆环外的进出缓冲距离（米），可根据需要调整
+        double start_x = static_cast<double>(center_x) - (static_cast<double>(radius) + approach);
+        double end_x = static_cast<double>(center_x) + (static_cast<double>(radius) + approach);
+        double start_y = static_cast<double>(center_y);
+        double end_y = static_cast<double>(center_y);
+
+        for (int i = 0; i < n; ++i)
+        {
+            double t = static_cast<double>(i) / static_cast<double>(n - 1);
+            geometry_msgs::Point p;
+            p.x = static_cast<float>(start_x + t * (end_x - start_x));
+            p.y = static_cast<float>(start_y + t * (end_y - start_y));
+            p.z = z;
+            waypoints.push_back(p);
+        }
+
+        initialized = true;
+        if (if_debug == 1)
+            ROS_INFO("fly_through_circle_ring (straight pass): initialized %d waypoints center(%.2f, %.2f) radius %.2f", (int)waypoints.size(), center_x, center_y, radius);
+    }
+
+    if (waypoints.empty())
+    {
+        initialized = false;
+        return true;
+    }
+
+    // 顺序飞到每个路径点（直线穿越）
+    geometry_msgs::Point cur_wp = waypoints[idx];
+    if (mission_pos_cruise(cur_wp.x, cur_wp.y, cur_wp.z, 0.0f, error_max))
+    {
+        idx++;
+        if (idx >= static_cast<int>(waypoints.size()))
+        {
+            // 完成直线穿环，清理并返回 true
+            initialized = false;
+            waypoints.clear();
+            idx = 0;
+            if (if_debug == 1)
+                ROS_INFO("fly_through_circle_ring (straight pass): completed");
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/************************************************************************
+函数 11: 方环飞行函数
+在指定边长和高度上，依次飞越一个正方形的四个角
+*************************************************************************/
+bool fly_through_square_ring(float center_x, float center_y, float z, float side_length, float error_max);
+bool fly_through_square_ring(float center_x, float center_y, float z, float side_length, float error_max)
+{
+    static bool initialized = false;
+    static std::vector<geometry_msgs::Point> corners;
+    static int idx = 0;
+
+    if (!initialized)
+    {
+        corners.clear();
+        idx = 0;
+        float half = side_length / 2.0f;
+        geometry_msgs::Point p;
+        // 顺时针或逆时针绕四角
+        p.x = center_x - half;
+        p.y = center_y - half;
+        p.z = z;
+        corners.push_back(p);
+        p.x = center_x + half;
+        p.y = center_y - half;
+        corners.push_back(p);
+        p.x = center_x + half;
+        p.y = center_y + half;
+        corners.push_back(p);
+        p.x = center_x - half;
+        p.y = center_y + half;
+        corners.push_back(p);
+
+        initialized = true;
+        if (if_debug == 1) ROS_INFO("fly_through_square_ring: initialized 4 corners center(%.2f,%.2f) side %.2f", center_x, center_y, side_length);
+    }
+
+    if (corners.empty())
+    {
+        initialized = false;
+        return true;
+    }
+
+    geometry_msgs::Point cur_c = corners[idx];
+    if (mission_pos_cruise(cur_c.x, cur_c.y, cur_c.z, 0.0f, error_max))
+    {
+        idx++;
+        if (idx >= (int)corners.size())
+        {
+            idx = 0; // 完成一圈
+            // 完成后清理和返回
+            initialized = false;
+            corners.clear();
+            idx = 0;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// 新增工具函数：角度归一化、点到点距离平方
+// static inline double normalizeAngle(double a)
+// {
+//     while (a > M_PI) a -= 2.0 * M_PI;
+//     while (a < -M_PI) a += 2.0 * M_PI;
+//     return a;
+// }
+
+// static inline double pointDist2(double ax, double ay, double bx, double by) {
+//     double dx = ax - bx;
+//     double dy = ay - by;
+//     return dx*dx + dy*dy;
+// }
+
+// 新增：判断给定方向（中心角） +/- half_angle 区域是否清晰（前方无障碍）
+// forward declaration for use earlier in file
+// 移除：isDirectionClear 实现（避障相关）。返回 true 作为占位行为。
+bool isDirectionClear(double center_angle, double min_clear_dist, double half_angle)
+{
+    (void)center_angle; (void)min_clear_dist; (void)half_angle;
+    return true;
+}
+
+// 新增：返回空间中任意点到最近障碍物的欧式距离（世界相对坐标）
+// 移除：nearestObstacleDistance（避障相关）。提供简单占位实现返回大距离。
+static inline double nearestObstacleDistance(double x, double y)
+{
+    (void)x; (void)y;
+    return 1e6;
+}
+
+// 采样线段上的点检测沿线是否满足最小间距
+// 移除：isPathClear（避障相关）。提供简单占位实现，始终返回 true。
+bool isPathClear(double from_x, double from_y, double to_x, double to_y, double min_clear)
+{
+    (void)from_x; (void)from_y; (void)to_x; (void)to_y; (void)min_clear;
+    return true;
+}
+
+// 新增：垂直方环函数实现
+bool fly_through_vertical_square_ring(float center_x, float center_y, float center_z, float side_length, float error_max) {
+    static bool initialized_v = false;
+    static std::vector<geometry_msgs::Point> corners_v;
+    static int idx_v = 0;
+    if (!initialized_v) {
+        corners_v.clear();
+        idx_v = 0;
+        float half = side_length / 2.0f;
+        geometry_msgs::Point p;
+        p.x = center_x; // constant x
+        p.y = center_y - half; p.z = center_z - half; corners_v.push_back(p);
+        p.x = center_x; p.y = center_y + half; p.z = center_z - half; corners_v.push_back(p);
+        p.x = center_x; p.y = center_y + half; p.z = center_z + half; corners_v.push_back(p);
+        p.x = center_x; p.y = center_y - half; p.z = center_z + half; corners_v.push_back(p);
+        initialized_v = true;
+        if (if_debug == 1) ROS_INFO("fly_through_vertical_square_ring: initialized 4 corners center(%.2f,%.2f,%.2f) side %.2f", center_x, center_y, center_z, side_length);
+    }
+    if (corners_v.empty()) {
+        initialized_v = false; return true;
+    }
+    geometry_msgs::Point cur = corners_v[idx_v];
+    if (mission_pos_cruise(cur.x, cur.y, cur.z, 0.0f, error_max)) {
+        idx_v++;
+        if (idx_v >= (int)corners_v.size()) {
+            idx_v = 0; initialized_v = false; corners_v.clear(); return true;
+        }
+    }
+    return false;
+}
+
