@@ -191,19 +191,21 @@ int main(int argc, char **argv)
     // mission2: 避障巡航到目标点(17.0, 2.5)
     case 2:
     {
-      // 目标以相对坐标表示（相对于起飞点）
-      float target_x = 17.0f; // 相对坐标，已更新为 15.0
-      float target_y = 2.5f;  // 相对坐标
-      if (!isReached(target_x, target_y, ALTITUDE, err_max))
-      {
-        avoid_to_point(target_x, target_y, ALTITUDE, 0, err_max);
-      }
-      else
-      {
-        // 目标点到达后，直接切换到 case 4（跳过 case 3）
-        mission_num = 4;
-        last_request = ros::Time::now();
-      }
+        // 目标以相对坐标表示（相对于起飞点）
+        float target_x = 17.0f; // 相对坐标，按需修改
+        float target_y = 2.5f;  // 相对坐标
+        if (!isReached(15.0f, local_pos.pose.pose.position.y, ALTITUDE, err_max))
+        {
+          // 使用新的扇区选择算法计算中间避障点并朝该点巡航
+          geometry_msgs::Point avoid_p = calculateAvoidancePoint(target_x, target_y, ALTITUDE);
+          mission_pos_cruise(static_cast<float>(avoid_p.x), static_cast<float>(avoid_p.y), ALTITUDE, 0, err_max);
+        }
+        else
+        {
+          // 目标点到达后，直接切换到 case 4（跳过 case 3）
+          mission_num = 4;
+          last_request = ros::Time::now();
+        }
       break;
     }
 
@@ -212,41 +214,80 @@ int main(int argc, char **argv)
     {
       static bool circle_done = false;
       static bool square_done = false;
-      // 参考点：以 mission2 的目标为环中心（修改为你实际想要的中心）
+      err_max=.1f;
+      static int circle_flag=0;
+      switch (circle_flag)
+      {
+        case 0:
+        mission_pos_cruise(18.0f, 2.4f, ALTITUDE, 0, err_max);
+        if(isReached(18.0f,2.4f,ALTITUDE,err_max))
+        {
+          circle_flag=1;
+        }
+        break;
+        case 1:
 
-      if (!circle_done)
-      {
-        float ring_center_x = 19.0f; // 如果你需要用 15.0 或其他，请修改为相应值
-        float ring_center_y = 2.4f;
-        float ring_alt = ALTITUDE;
-        // 圆环：半径 1.0m ，点数 12
-        if (fly_through_circle_ring(ring_center_x, ring_center_y, ring_alt, 1.0f, 12, err_max))
+      MAX_STEP=0.3;
+        mission_pos_cruise(20.0f, 2.4f, ALTITUDE, 0, err_max);
+        if(isReached(20.0f,2.4f,ALTITUDE,err_max))
         {
-          circle_done = true;
-          last_request = ros::Time::now();
-          ROS_INFO("圆环完成");
+          circle_flag=2;
         }
-      }
-      else if (!square_done)
-      {
-        float ring_center_x = 19.0f; // 使用 mission2 目标 x 或你实际需要的中心
-        float ring_center_y = 2.4f;
-        float ring_center_z = ALTITUDE; // 垂直方环中心高度
-        float ring_alt = ALTITUDE;
-        // 垂直方环：center_x不变，在 y-z 平面穿越
-        if (fly_through_vertical_square_ring(ring_center_x, ring_center_y, ring_center_z, 2.2f, err_max))
+        break;
+        case 2:
+      MAX_STEP=0.7;
+        mission_pos_cruise(21.0f, 0.2f, ALTITUDE, 0, err_max);
+        if(isReached(21.0f,0.2f,ALTITUDE,err_max))
         {
-          square_done = true;
-          last_request = ros::Time::now();
-          ROS_INFO("垂直方环完成");
+          circle_flag=3;
         }
-      }
-      else
-      {
+        break;
+        case 3:
+      MAX_STEP=0.5;
+        mission_pos_cruise(23.0f, 0.2f, ALTITUDE, 0, err_max);
+        if(isReached(23.0f,0.2f,ALTITUDE,err_max))
+        {
+          circle_flag=4;
+        }
+        break;
+        case 4:
+      MAX_STEP=0.7;
+      err_max=0.2f;
+       
+      
+      // if (!circle_done)
+      // {
+      //   float ring_center_x = 19.0f; // 如果你需要用 15.0 或其他，请修改为相应值
+      //   float ring_center_y = 2.4f;
+      //   float ring_alt = ALTITUDE;
+      //   // 圆环：半径 1.0m ，点数 12
+      //   if (fly_through_circle_ring(ring_center_x, ring_center_y, ring_alt, 1.0f, 12, err_max))
+      //   {
+      //     circle_done = true;
+      //     last_request = ros::Time::now();
+      //     ROS_INFO("圆环完成");
+      //   }
+      // }
+      // else if (!square_done)
+      // {
+      //   float ring_center_x = 22.0f; // 使用 mission2 目标 x 或你实际需要的中心
+      //   float ring_center_y = 0.2f;
+      //   float ring_center_z = ALTITUDE; // 垂直方环中心高度
+      //   float ring_alt = ALTITUDE;
+      //   // 垂直方环：center_x不变，在 y-z 平面穿越
+      //   if (fly_through_vertical_square_ring(ring_center_x, ring_center_y, ring_center_z, 2.2f, err_max))
+      //   {
+      //     square_done = true;
+      //     last_request = ros::Time::now();
+      //     ROS_INFO("垂直方环完成");
+      //   }
+      // }
+      // else
+      // {
         // 两个环都完成，结束任务或进入下一个流程
         mission_num = -1;
         last_request = ros::Time::now();
-      }
+       }
     }
     break;
     }
